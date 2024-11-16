@@ -1,0 +1,56 @@
+name: Continuous Deployment Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-22.04
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      VM_USER: "adminuser"
+      VM_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v3
+
+      - name: Configure Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.3.0
+
+      - name: Initialize Terraform Configuration
+        run: terraform init
+        working-directory: infrastructure
+
+      - name: Execute Terraform to Set Up Resources
+        run: terraform apply -auto-approve -var="user_name=${{ env.VM_USER }}" -var="user_password=${{ env.VM_PASSWORD }}"
+        working-directory: infrastructure
+
+      - name: Fetch Terraform Outputs
+        id: terraform_outputs
+        run: |
+          echo "public_ip=$(terraform output -raw public_ip)" >> $GITHUB_ENV
+          echo "acr_server=$(terraform output -raw acr_server)" >> $GITHUB_ENV
+          echo "acr_username=$(terraform output -raw acr_username)" >> $GITHUB_ENV
+          echo "acr_password=$(terraform output -raw acr_password)" >> $GITHUB_ENV
+
+      - name: Azure ACR Login
+        run: |
+          echo ${{ env.acr_password }} | docker login ${{ env.acr_server }} -u ${{ env.acr_username }} --password-stdin
+
+      - name: Build Flask Application Docker Image
+        working-directory: app
+        run: |
+          docker build -t flask-app:${{ github.sha }} .
+          docker tag flask-app:${{ github.sha }} ${{ env.acr_server }}/flask-app:${{ github.sha }}
+
+      - name: Push Docker Image to Azure ACR
+        run: |
+          docker push ${{ env.acr_server }}/flask-app:${{ github.sha }}
