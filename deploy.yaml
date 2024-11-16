@@ -1,0 +1,122 @@
+name: Deploy and Provision HTML App with Infrastructure Automation
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  # Terraform Infrastructure Provisioning Job
+  terraform:
+    name: Terraform Infrastructure Provisioning
+    runs-on: ubuntu-22.04  # Using ubuntu-22.04 runner
+
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+    steps:
+      # Step 1: Checkout code from the repository
+      - name: Checkout Code
+        uses: actions/checkout@v2
+
+      # Step 2: Login to Azure using credentials stored in secrets
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Step 3: Install the specified version of Terraform
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0  # Using the latest Terraform version
+
+      # Step 4: Initialize Terraform configuration
+      - name: Initialize Terraform
+        run: terraform init -input=false
+        working-directory: ./infrastructure
+
+      # Step 5: Generate Terraform execution plan
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan -input=false
+        working-directory: ./infrastructure
+
+      # Step 6: Apply the Terraform plan to provision resources if the branch is main
+      - name: Apply Terraform Plan
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve tfplan
+        working-directory: ./infrastructure
+
+  # Setup Python and Ansible Dependencies
+  setup-env:
+    name: Setup Python and Ansible
+    runs-on: ubuntu-22.04  # Using ubuntu-22.04 runner
+
+    needs: terraform  # This job will run after the terraform job completes
+
+    steps:
+      # Step 1: Setup Python 3.10 in the environment
+      - name: Install Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      # Step 2: Install required Python packages and Ansible
+      - name: Install Ansible and Dependencies
+        run: |
+          python -m pip install --upgrade pip  # Upgrade pip
+          pip install ansible==6.5.0  # Install a specific version of Ansible
+          sudo apt-get update && sudo apt-get install -y openssh-client  # Install SSH client for VM access
+
+  # SSH Configuration and VM Setup
+  ssh-setup:
+    name: SSH and VM Configuration
+    runs-on: ubuntu-22.04  # Using ubuntu-22.04 runner
+
+    needs: setup-env  # This job will run after the setup-env job completes
+
+    steps:
+      # Step 1: Setup SSH key for accessing the Azure VM
+      - name: Setup SSH Key for VM Access
+        run: |
+          eval $(ssh-agent -s)  # Start the SSH agent
+          chmod 600 azure-vm.pem  # Set the proper permissions for the private key
+          ssh-add azure-vm.pem  # Add the private key to the SSH agent
+          mkdir -p ~/.ssh  # Ensure the .ssh directory exists
+          # Disable strict host checking and configure SSH keep-alive settings
+          echo "Host *\n\tStrictHostKeyChecking no\n\tUserKnownHostsFile=/dev/null\n\tServerAliveInterval 90\n\tServerAliveCountMax 5" > ~/.ssh/config
+
+      # Step 2: Verify SSH connection to the VM
+      - name: Test SSH Connection to VM
+        run: |
+          ssh -i azure-vm.pem -o StrictHostKeyChecking=no azureuser@52.174.50.220 'echo "SSH connection successful"'
+
+      # Step 3: Ensure Python3 is installed on the remote VM if not already present
+      - name: Ensure Python3 is Installed on VM
+        run: |
+          ssh -i azure-vm.pem azureuser@52.174.50.220 'if ! command -v python3 &> /dev/null; then
+              sudo apt-get update && sudo apt-get install -y python3 python3-pip
+          fi'
+
+  # Deploy Application via Ansible Playbook
+  deploy-app:
+    name: Deploy App via Ansible Playbook
+    runs-on: ubuntu-22.04  # Using ubuntu-22.04 runner
+
+    needs: ssh-setup  # This job will run after the ssh-setup job completes
+
+    env:
+      ANSIBLE_HOST_KEY_CHECKING: "False"  # Disable SSH key checking for Ansible
+      ANSIBLE_SSH_RETRIES: "7"  # Increase SSH retries for better connection reliability
+      ANSIBLE_RETRY_FILES_ENABLED: "True"  # Enable retry files for Ansible
+
+    steps:
+      # Step 1: Run the Ansible playbook to deploy the application on the VM
+      - name: Run Ansible Playbook for Deployment
+        run: |
+          # Run the playbook with the VM IP address passed as an extra variable
+          ansible-playbook -i inventory.ini ./deploy-playbook.yml --extra-vars "vm_ip=52.174.50.220" -vvv
